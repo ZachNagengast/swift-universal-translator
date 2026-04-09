@@ -1,0 +1,38 @@
+# Xcode user-specific files
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+
+# Xcode workspace and derived data
+DerivedData/
+build/
+*.xcworkspace/contents.xcworkspacedata.bak
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Packages/
+Package.pins
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# CocoaPods (not used here, but standard)
+Pods/
+
+# Carthage (not used here, but standard)
+Carthage/Build/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# Local IDE / tooling
+.vscode/
+.idea/
+.cursor/
+.claude/

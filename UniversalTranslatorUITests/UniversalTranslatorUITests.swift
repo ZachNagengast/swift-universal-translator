@@ -1,10 +1,3 @@
-//
-//  UniversalTranslatorUITests.swift
-//  UniversalTranslatorUITests
-//
-//  Created by Zach Nagengast on 4/8/26.
-//
-
 import XCTest
 
 final class UniversalTranslatorUITests: XCTestCase {
