@@ -30,11 +30,13 @@ struct MessageBubbleView: View {
             Text(message.originalText)
                 .font(.subheadline)
                 .foregroundStyle(.white.opacity(0.5))
+                .textSelection(.enabled)
 
             Text(message.translatedText)
                 .font(.body)
                 .fontWeight(.medium)
                 .foregroundStyle(.white)
+                .textSelection(.enabled)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -108,7 +110,18 @@ private struct LLMDebugView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
 
-                    Section("LLM Output") {
+                    if !message.corrections.isEmpty {
+                        Section("ASR Corrections") {
+                            Text(message.corrections)
+                                .font(.body.monospaced())
+                                .padding(12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.orange.opacity(0.1))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                    }
+
+                    Section("LLM Output (translatedText)") {
                         Text(message.translatedText)
                             .font(.body.monospaced())
                             .padding(12)
@@ -118,6 +131,7 @@ private struct LLMDebugView: View {
                     }
                 }
                 .padding()
+                .textSelection(.enabled)
             }
             .navigationTitle("Translation Details")
             #if os(iOS)

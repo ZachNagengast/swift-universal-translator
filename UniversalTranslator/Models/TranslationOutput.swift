@@ -1,12 +1,14 @@
 import FoundationModels
 
-/// Generable schema for FoundationModels structured output.
+/// Structured output schema for the on-device translation LLM.
 ///
-/// Currently unused in the active pipeline (we settled on plain text generation
-/// because the on-device model produces more reliable output without a JSON schema constraint),
-/// but kept here as a reference for `@Generable` usage.
-@Generable
+/// Properties are generated in declaration order: the model fills `corrections`
+/// first (giving it a place to reason about ASR errors), then `translatedText`.
+@Generable(description: "A translation of spoken text between two languages")
 struct TranslationOutput {
+    @Guide(description: "If a word was misheard, write 'X → Y'. Otherwise leave empty.")
+    var corrections: String
+
     @Guide(description: "The translated text in the target language")
     var translatedText: String
 }

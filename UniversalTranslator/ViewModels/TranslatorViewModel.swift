@@ -1,4 +1,5 @@
 import Foundation
+import FoundationModels
 
 /// State machine for the translation pipeline.
 ///
@@ -33,11 +34,23 @@ enum PipelineState: Equatable {
 final class TranslatorViewModel {
     // MARK: - User-facing state
 
-    var leftLanguage: Language = .english
-    var rightLanguage: Language = .japanese
+    var leftLanguage: Language = .english {
+        didSet { UserDefaults.standard.set(leftLanguage.rawValue, forKey: "leftLanguage") }
+    }
+    var rightLanguage: Language = .japanese {
+        didSet { UserDefaults.standard.set(rightLanguage.rawValue, forKey: "rightLanguage") }
+    }
     var messages: [TranslationMessage] = []
     var pipelineState: PipelineState = .idle
-    var liveTranscription = ""
+    /// During recording, reads directly from the speech service's observable property.
+    /// After recording stops, shows the frozen final text until the bubble is created.
+    var liveTranscription: String {
+        if case .listening = pipelineState {
+            return speechService.currentTranscription
+        }
+        return frozenTranscription
+    }
+    private var frozenTranscription = ""
     var liveTranslation = ""
     /// Which side is currently active in the pipeline (drives chat-bubble alignment).
     var activeSide: PanelSide?
@@ -53,7 +66,7 @@ final class TranslatorViewModel {
     var isLoading = true
     var whisperProgress: Double = 0
     var ttsProgress: Double = 0
-    var loadingStatus = "Preparing..."
+    var loadingStatus = ""
 
     init(
         speechService: SpeechRecognitionService,
@@ -63,6 +76,15 @@ final class TranslatorViewModel {
         self.speechService = speechService
         self.translationService = translationService
         self.ttsService = ttsService
+
+        if let raw = UserDefaults.standard.string(forKey: "leftLanguage"),
+           let lang = Language(rawValue: raw) {
+            self.leftLanguage = lang
+        }
+        if let raw = UserDefaults.standard.string(forKey: "rightLanguage"),
+           let lang = Language(rawValue: raw) {
+            self.rightLanguage = lang
+        }
     }
 
     // MARK: - Model loading
@@ -70,8 +92,15 @@ final class TranslatorViewModel {
     /// Loads WhisperKit and Kokoro in parallel — they don't compete for hardware
     /// (WhisperKit runs on the ANE, Kokoro on the GPU/Metal) so concurrent loading
     /// roughly halves total startup time on first launch.
+    /// Computed status derived from service loading progress.
+    var loadingStatusText: String {
+        if speechService.loadingProgress >= 1.0 && ttsService.loadingProgress >= 1.0 {
+            return "Loading models..."
+        }
+        return "Downloading models..."
+    }
+
     func loadModels() async {
-        loadingStatus = "Downloading models..."
         print("[Pipeline] Loading WhisperKit (ANE) and Kokoro (GPU) in parallel")
 
         await withTaskGroup(of: Void.self) { group in
@@ -135,7 +164,7 @@ final class TranslatorViewModel {
 
     func clearConversation() {
         messages.removeAll()
-        liveTranscription = ""
+        frozenTranscription = ""
         liveTranslation = ""
         if case .error = pipelineState {
             pipelineState = .idle
@@ -172,14 +201,13 @@ final class TranslatorViewModel {
         let sourceLanguage = side == .left ? leftLanguage : rightLanguage
         pipelineState = .listening(side)
         activeSide = side
-        liveTranscription = ""
+        frozenTranscription = ""
         liveTranslation = ""
 
         print("[Pipeline] Starting ASR in \(sourceLanguage.displayName) for \(side == .left ? "left" : "right") side")
 
         do {
             try await speechService.startRecording(language: sourceLanguage)
-            observeTranscription()
         } catch {
             print("[Pipeline] Mic error: \(error.localizedDescription)")
             transitionToError("Mic error — try again")
@@ -196,11 +224,11 @@ final class TranslatorViewModel {
             print("[Pipeline] Empty transcription — returning to idle")
             pipelineState = .idle
             activeSide = nil
-            liveTranscription = ""
+            frozenTranscription = ""
             return
         }
 
-        liveTranscription = transcribedText
+        frozenTranscription = transcribedText
         let source = side == .left ? leftLanguage : rightLanguage
         let target = side == .left ? rightLanguage : leftLanguage
 
@@ -228,7 +256,7 @@ final class TranslatorViewModel {
                 }
             }
 
-            print("[Pipeline] Translation result: '\(result.translatedText)'")
+            print("[Pipeline] Translation result: '\(result.translatedText)' | Corrections: '\(result.corrections)'")
 
             // Materialize the chat bubble immediately so the user sees the result
             // even if TTS later fails or gets interrupted.
@@ -239,10 +267,11 @@ final class TranslatorViewModel {
                 targetLanguage: target,
                 timestamp: Date(),
                 side: side,
+                corrections: result.corrections,
                 llmPrompt: result.prompt
             )
             messages.append(message)
-            liveTranscription = ""
+            frozenTranscription = ""
             liveTranslation = ""
 
             // Speak the translation in the target language.
@@ -257,6 +286,24 @@ final class TranslatorViewModel {
 
             pipelineState = .idle
             activeSide = nil
+        } catch let error as TranslationError {
+            switch error {
+            case .refused(let reason):
+                print("[Pipeline] Model refused: \(reason)")
+                transitionToError(reason)
+            case .emptyResponse:
+                print("[Pipeline] Empty translation")
+                transitionToError("Translation returned empty — try again")
+            }
+        } catch let error as LanguageModelSession.GenerationError {
+            switch error {
+            case .guardrailViolation:
+                print("[Pipeline] Guardrail violation — content flagged as unsafe")
+                transitionToError("Content flagged by safety filter")
+            default:
+                print("[Pipeline] LLM error: \(error.localizedDescription)")
+                transitionToError("Translation failed — try again")
+            }
         } catch {
             print("[Pipeline] Translation failed: \(error.localizedDescription)")
             transitionToError("Translation failed — try again")
@@ -264,29 +311,23 @@ final class TranslatorViewModel {
     }
 
     /// Briefly flash an error state, then auto-reset to idle so the user isn't stuck.
+    /// Cancels any previous recovery timer so rapid errors don't stack up.
+    private var errorRecoveryTask: Task<Void, Never>?
+
     private func transitionToError(_ message: String) {
         pipelineState = .error(message)
         activeSide = nil
-        liveTranscription = ""
+        frozenTranscription = ""
         liveTranslation = ""
-        Task { [weak self] in
+
+        errorRecoveryTask?.cancel()
+        errorRecoveryTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(2))
-            await MainActor.run {
-                if case .error = self?.pipelineState {
-                    self?.pipelineState = .idle
-                }
+            guard !Task.isCancelled else { return }
+            if case .error = self?.pipelineState {
+                self?.pipelineState = .idle
             }
         }
     }
 
-    /// Pump live transcription updates from the ASR service into the view-model state
-    /// at 10 Hz so SwiftUI animates them smoothly.
-    private func observeTranscription() {
-        Task { @MainActor in
-            while speechService.isRecording {
-                liveTranscription = speechService.currentTranscription
-                try? await Task.sleep(for: .milliseconds(100))
-            }
-        }
-    }
 }

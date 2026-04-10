@@ -5,22 +5,12 @@ import FoundationModels
 /// (surfaced in the LLM details sheet for inspection).
 struct TranslationServiceResult {
     let translatedText: String
+    let corrections: String
     let prompt: String
 }
 
-/// Translation service backed by Apple's on-device Foundation Model.
-///
-/// Why this design:
-/// - **Plain text generation, not `@Generable`.** Structured output via `@Generable`
-///   produced frequent `decodingFailure` errors on this small on-device model.
-///   Plain text + greedy sampling is much more reliable for short translations.
-/// - **Few-shot prompting.** We embed three reference examples per language pair so the
-///   model imitates the format. The third example is intentionally an opinion-style question
-///   ("What do you think about modern art?") to teach it to *translate* questions, not answer them.
-/// - **Text-to-translate placed BEFORE examples** with explicit `===== TEXT TO TRANSLATE =====`
-///   delimiters. This frames the input as data, not as a chat message to respond to.
-/// - **Token limit + retry.** `maximumResponseTokens: 256` prevents runaway loops, and we
-///   retry up to twice on empty/failed output before throwing.
+/// Translation service backed by Apple's on-device Foundation Model using `@Generable`
+/// structured output with few-shot prompting.
 @Observable
 @MainActor
 final class TranslationService {
@@ -88,61 +78,178 @@ final class TranslationService {
     ]
 
     /// Translate `text` from `source` to `target`, streaming partial output via `onPartial`.
-    /// Returns the final cleaned translation along with the prompt used.
     func translateStreaming(
         text: String,
         from source: Language,
         to target: Language,
         onPartial: @escaping (String) -> Void
     ) async throws -> TranslationServiceResult {
-        let instructions = buildInstructions(from: source, to: target, textToTranslate: text)
-        // The "user prompt" is just a trigger — the actual content lives in the instructions.
-        let userPrompt = "Now output the \(target.displayName) translation."
-        let prompt = "\(instructions)\n\n\(userPrompt)"
-
         print("[Translation] \(source.displayName) → \(target.displayName): '\(text)'")
 
+        // IMPORTANT: Do NOT set maximumResponseTokens here. With @Generable, constrained
+        // sampling terminates naturally when the JSON schema is complete. Setting a token
+        // limit risks truncating the JSON mid-generation → decodingFailure.
         let options = GenerationOptions(
             sampling: .greedy,
-            temperature: 0.0,
-            maximumResponseTokens: 256
+            temperature: 0.0
         )
 
-        var lastError: Error?
-        for attempt in 1...2 {
-            do {
-                let translated = try await attemptTranslation(
-                    text: userPrompt,
-                    instructions: instructions,
-                    options: options,
-                    onPartial: onPartial
+        // Try @Generable first (structured output with corrections field).
+        do {
+            let result = try await attemptTranslation(
+                text: text,
+                from: source,
+                to: target,
+                options: options,
+                onPartial: onPartial
+            )
+            if !result.output.translatedText.isEmpty {
+                print("[Translation] Result: '\(result.output.translatedText)' | Corrections: '\(result.output.corrections)'")
+                return TranslationServiceResult(
+                    translatedText: result.output.translatedText,
+                    corrections: result.output.corrections,
+                    prompt: result.transcriptDump
                 )
-                if !translated.isEmpty {
-                    print("[Translation] Result: '\(translated)'")
-                    return TranslationServiceResult(translatedText: translated, prompt: prompt)
+            }
+        } catch let error as LanguageModelSession.GenerationError {
+            switch error {
+            case .guardrailViolation:
+                // Guardrails triggered — fall back to permissive plain-text mode.
+                // Translation is a content transformation, not content generation,
+                // so permissiveContentTransformations is the appropriate mode here.
+                print("[Translation] Guardrail hit — retrying with permissive content transformations")
+                if let result = try? await attemptPermissiveTranslation(
+                    text: text, from: source, to: target, onPartial: onPartial
+                ) {
+                    return result
                 }
-                print("[Translation] Attempt \(attempt) returned empty result")
-            } catch {
-                lastError = error
-                print("[Translation] Attempt \(attempt) failed: \(error)")
+                throw error
+            case .refusal(let refusal, _):
+                // Model refused — surface the explanation if available.
+                let explanationResponse = try? await refusal.explanation
+                let explanation = explanationResponse?.content ?? "The model declined this request."
+                print("[Translation] Model refused: \(explanation)")
+                throw TranslationError.refused(explanation)
+            default:
+                print("[Translation] LLM error: \(error)")
+                throw error
             }
         }
 
-        if let lastError {
-            throw lastError
-        }
         throw TranslationError.emptyResponse
     }
 
     private func attemptTranslation(
         text: String,
-        instructions: String,
+        from source: Language,
+        to target: Language,
         options: GenerationOptions,
         onPartial: @escaping (String) -> Void
-    ) async throws -> String {
-        let session = LanguageModelSession(instructions: instructions)
-        let stream = session.streamResponse(to: text, options: options)
+    ) async throws -> (output: TranslationOutput, transcriptDump: String) {
+        let transcript = buildFewShotTranscript(from: source, to: target)
+        let session = LanguageModelSession(transcript: transcript)
 
+        let stream = session.streamResponse(
+            to: text,
+            generating: TranslationOutput.self,
+            options: options
+        )
+
+        var finalOutput = TranslationOutput(corrections: "", translatedText: "")
+        var lastCorrections = ""
+        var lastTranslation = ""
+
+        for try await snapshot in stream {
+            // Log every streaming delta so we can see the model's token-by-token output
+            if let corrections = snapshot.content.corrections, corrections != lastCorrections {
+                let delta = String(corrections.dropFirst(lastCorrections.count))
+                print("[LLM] corrections += '\(delta)' → '\(corrections)'")
+                lastCorrections = corrections
+                finalOutput.corrections = corrections
+            }
+            if let partial = snapshot.content.translatedText, partial != lastTranslation {
+                let delta = String(partial.dropFirst(lastTranslation.count))
+                print("[LLM] translatedText += '\(delta)' → '\(partial)'")
+                lastTranslation = partial
+                finalOutput.translatedText = partial
+                onPartial(cleanTranslation(partial))
+            }
+        }
+
+        print("[LLM] Final corrections: '\(finalOutput.corrections)'")
+        print("[LLM] Final translation: '\(finalOutput.translatedText)'")
+
+        // Also dump the full transcript so we can see what the model saw
+        for (i, entry) in session.transcript.enumerated() {
+            print("[LLM] Transcript[\(i)]: \(entry)")
+        }
+
+        finalOutput.translatedText = cleanTranslation(finalOutput.translatedText)
+
+        let transcriptDump = session.transcript.map { String(describing: $0) }.joined(separator: "\n---\n")
+        return (finalOutput, transcriptDump)
+    }
+
+    /// Build a Transcript with instructions + few-shot example turns.
+    ///
+    /// Each example becomes a prompt→response pair in the conversation history, using
+    /// `TranslationOutput` as the structured response type. The model sees these as
+    /// prior turns and continues the pattern for the real request.
+    private func buildFewShotTranscript(from source: Language, to target: Language) -> Transcript {
+        let instructionText = """
+        Translate text from \(source.displayName) to \(target.displayName). \
+        The input is from speech recognition and may contain errors. \
+        Note any corrections in the corrections field. \
+        If the input is a question, translate the question — do NOT answer it.
+        """
+
+        var entries: [Transcript.Entry] = [
+            .instructions(Transcript.Instructions(segments: [
+                .text(Transcript.TextSegment(content: instructionText))
+            ], toolDefinitions: []))
+        ]
+
+        // Add few-shot examples as prompt→response pairs
+        if let sourceExamples = Self.examples[source],
+           let targetExamples = Self.examples[target],
+           sourceExamples.count >= 3,
+           targetExamples.count >= 3 {
+            for i in 0..<3 {
+                let exampleOutput = TranslationOutput(
+                    corrections: "",
+                    translatedText: targetExamples[i]
+                )
+                entries.append(.prompt(Transcript.Prompt(segments: [
+                    .text(Transcript.TextSegment(content: sourceExamples[i]))
+                ], responseFormat: Transcript.ResponseFormat(type: TranslationOutput.self))))
+                entries.append(.response(Transcript.Response(assetIDs: [], segments: [
+                    .structure(Transcript.StructuredSegment(
+                        source: String(describing: TranslationOutput.self),
+                        content: exampleOutput.generatedContent
+                    ))
+                ])))
+            }
+        }
+
+        return Transcript(entries: entries)
+    }
+
+    /// Fallback: plain-text translation with `permissiveContentTransformations`.
+    /// Used when @Generable hits guardrails on sensitive-but-legitimate translation input.
+    /// This mode is designed for content transformation tasks (like translation) where
+    /// the model needs to reason about sensitive source material without blocking it.
+    private func attemptPermissiveTranslation(
+        text: String,
+        from source: Language,
+        to target: Language,
+        onPartial: @escaping (String) -> Void
+    ) async throws -> TranslationServiceResult {
+        let model = SystemLanguageModel(guardrails: .permissiveContentTransformations)
+        let instructions = buildPlainTextInstructions(from: source, to: target, textToTranslate: text)
+        let session = LanguageModelSession(model: model, instructions: instructions)
+        let options = GenerationOptions(sampling: .greedy, temperature: 0.0, maximumResponseTokens: 512)
+
+        let stream = session.streamResponse(to: "Now output the \(target.displayName) translation.", options: options)
         var finalText = ""
         for try await snapshot in stream {
             let s = snapshot.content
@@ -151,29 +258,33 @@ final class TranslationService {
                 onPartial(cleanTranslation(s))
             }
         }
-        return cleanTranslation(finalText)
+
+        let cleaned = cleanTranslation(finalText)
+        print("[Translation] Permissive fallback result: '\(cleaned)'")
+        return TranslationServiceResult(
+            translatedText: cleaned,
+            corrections: "",
+            prompt: "Permissive plain-text fallback: \(source.displayName) → \(target.displayName)"
+        )
     }
 
-    /// Build the system prompt. Layout:
-    ///   1. Role + ASR-aware instructions (silently correct misheard words)
-    ///   2. Strict rules (NEVER answer, NEVER add commentary, etc.)
-    ///   3. The TEXT TO TRANSLATE block (clearly delimited so it reads as data)
-    ///   4. Three reference example translations
-    ///   5. Final reminder to translate ONLY the delimited text
-    private func buildInstructions(from source: Language, to target: Language, textToTranslate: String) -> String {
+    /// Full text-based prompt used by the permissive plain-text fallback path.
+    /// Embeds the text to translate before the few-shot examples with clear delimiters.
+    private func buildPlainTextInstructions(from source: Language, to target: Language, textToTranslate: String) -> String {
         var instructions = """
         You are a machine translator. Your ONLY job is to translate text from \(source.displayName) to \(target.displayName).
 
-        The input text comes from a speech recognition (ASR) model, so it may contain transcription errors, missing punctuation, homophones, or misheard words. Use context to infer the speaker's intended words and translate that intended meaning. Silently correct obvious errors as you translate. Do NOT mention the corrections.
+        The input text comes from a speech recognition (ASR) model, so it may contain \
+        transcription errors, missing punctuation, homophones, or misheard words. Use context \
+        to infer the speaker's intended words and translate that intended meaning. Silently \
+        correct obvious errors as you translate. Do NOT mention the corrections.
 
         Strict rules:
         - Translate the text into natural, fluent \(target.displayName).
         - NEVER answer questions in the text. Translate the question itself.
         - NEVER add commentary, explanations, opinions, or disclaimers.
         - NEVER wrap output in quotes.
-        - NEVER respond as an assistant. You are a translation function, not a chatbot.
         - If the text is a question, translate it as a question. Do NOT answer it.
-        - If a word seems wrong (e.g. "rain man" likely means "ramen"), translate the intended word.
         - Output ONLY the \(target.displayName) translation. Nothing else.
 
         ===== TEXT TO TRANSLATE (\(source.displayName)) =====
@@ -185,19 +296,17 @@ final class TranslationService {
            let targetExamples = Self.examples[target],
            sourceExamples.count >= 3,
            targetExamples.count >= 3 {
-            instructions += "\n\nReference examples of correct translation style (do NOT translate these, they are just for reference):\n"
+            instructions += "\n\nExamples:\n"
             for i in 0..<3 {
-                instructions += "\n\(source.displayName) text: \(sourceExamples[i])\n"
-                instructions += "Correct \(target.displayName) translation: \(targetExamples[i])\n"
+                instructions += "\(source.displayName): \(sourceExamples[i]) → \(target.displayName): \(targetExamples[i])\n"
             }
-            instructions += "\nNow translate ONLY the text between the ===== TEXT TO TRANSLATE markers above into \(target.displayName)."
+            instructions += "\nNow translate ONLY the text between the ===== markers above."
         }
 
         return instructions
     }
 
     /// Strip wrapping quotes the model occasionally adds, plus whitespace.
-    /// Handles ASCII, smart, French, and CJK quote pairs.
     private func cleanTranslation(_ text: String) -> String {
         var t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let quoteChars: [(Character, Character)] = [
@@ -214,10 +323,12 @@ final class TranslationService {
 
 enum TranslationError: Error, LocalizedError {
     case emptyResponse
+    case refused(String)
 
     var errorDescription: String? {
         switch self {
         case .emptyResponse: "Translation returned no text"
+        case .refused(let reason): reason
         }
     }
 }

@@ -112,11 +112,15 @@ struct ConversationView: View {
         .clipShape(RoundedRectangle(cornerRadius: 24))
         .sheet(isPresented: $showLeftPicker) {
             LanguageSelectorView(selectedLanguage: $leftLanguage)
+                #if os(iOS)
                 .presentationDetents([.medium])
+                #endif
         }
         .sheet(isPresented: $showRightPicker) {
             LanguageSelectorView(selectedLanguage: $rightLanguage)
+                #if os(iOS)
                 .presentationDetents([.medium])
+                #endif
         }
     }
 

@@ -13,6 +13,8 @@ struct TranslationMessage: Identifiable {
     let timestamp: Date
     /// Which side of the device initiated the recording.
     let side: PanelSide
+    /// ASR corrections the LLM identified (e.g. "rain man → ramen"). Empty if none.
+    var corrections: String = ""
     /// The full prompt sent to the on-device LLM. Surfaced in the details sheet
     /// for inspection.
     var llmPrompt: String = ""

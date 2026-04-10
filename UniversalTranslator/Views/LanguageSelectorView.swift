@@ -28,6 +28,9 @@ struct LanguageSelectorView: View {
                     .padding(.vertical, 4)
                 }
             }
+            #if os(macOS)
+            .frame(minWidth: 280, minHeight: 350)
+            #endif
             .navigationTitle("Select Language")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)

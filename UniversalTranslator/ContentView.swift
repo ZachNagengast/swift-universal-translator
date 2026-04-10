@@ -17,7 +17,7 @@ struct ContentView: View {
                 TranslatorView(viewModel: viewModel)
             } else if let viewModel {
                 ModelLoadingView(
-                    status: viewModel.loadingStatus,
+                    status: viewModel.loadingStatus.isEmpty ? viewModel.loadingStatusText : viewModel.loadingStatus,
                     whisperProgress: speechService.loadingProgress,
                     ttsProgress: ttsService.loadingProgress
                 )
