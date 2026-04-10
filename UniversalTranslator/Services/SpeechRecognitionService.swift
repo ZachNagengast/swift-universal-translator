@@ -1,5 +1,5 @@
 import Foundation
-import WhisperKit
+@preconcurrency import WhisperKit
 
 /// Speech-to-text service backed by WhisperKit running on the Apple Neural Engine.
 ///
@@ -83,7 +83,7 @@ final class SpeechRecognitionService {
             folder = try await WhisperKit.download(
                 variant: Self.modelVariant,
                 from: Self.modelRepo
-            ) { [weak self] progress in
+            ) { @Sendable [weak self] progress in
                 Task { @MainActor in
                     self?.loadingProgress = progress.fractionCompleted
                 }
@@ -156,7 +156,7 @@ final class SpeechRecognitionService {
             audioProcessor: whisperKit.audioProcessor,
             decodingOptions: options,
             silenceThreshold: 0.3,
-            stateChangeCallback: { [weak self] _, newState in
+            stateChangeCallback: { @Sendable [weak self] _, newState in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     let confirmed = newState.confirmedSegments.map(\.text).joined(separator: " ")

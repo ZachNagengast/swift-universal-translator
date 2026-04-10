@@ -125,9 +125,7 @@ final class TranslationService {
                 }
                 throw error
             case .refusal(let refusal, _):
-                // Model refused — surface the explanation if available.
-                let explanationResponse = try? await refusal.explanation
-                let explanation = explanationResponse?.content ?? "The model declined this request."
+                let explanation = await Self.refusalExplanation(refusal)
                 print("[Translation] Model refused: \(explanation)")
                 throw TranslationError.refused(explanation)
             default:
@@ -266,6 +264,22 @@ final class TranslationService {
             corrections: "",
             prompt: "Permissive plain-text fallback: \(source.displayName) → \(target.displayName)"
         )
+    }
+
+    /// Extract the refusal explanation as a plain String.
+    /// `Response<String>` isn't Sendable in the current SDK, so we wrap the call
+    /// in a nonisolated Task to avoid crossing actor boundaries.
+    private static func refusalExplanation(
+        _ refusal: LanguageModelSession.GenerationError.Refusal
+    ) async -> String {
+        await Task.detached {
+            do {
+                let response = try await refusal.explanation
+                return response.content
+            } catch {
+                return "The model declined to translate this request."
+            }
+        }.value
     }
 
     /// Full text-based prompt used by the permissive plain-text fallback path.

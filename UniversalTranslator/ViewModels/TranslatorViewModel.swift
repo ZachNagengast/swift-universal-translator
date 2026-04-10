@@ -103,26 +103,25 @@ final class TranslatorViewModel {
     func loadModels() async {
         print("[Pipeline] Loading WhisperKit (ANE) and Kokoro (GPU) in parallel")
 
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { @MainActor in
-                do {
-                    try await self.speechService.loadModel()
-                    print("[Pipeline] WhisperKit loaded")
-                } catch {
-                    print("[Pipeline] WhisperKit load failed: \(error.localizedDescription)")
-                    self.loadingStatus = "ASR error: \(error.localizedDescription)"
-                }
+        async let asrLoad: Void = {
+            do {
+                try await self.speechService.loadModel()
+                print("[Pipeline] WhisperKit loaded")
+            } catch {
+                print("[Pipeline] WhisperKit load failed: \(error.localizedDescription)")
+                await MainActor.run { self.loadingStatus = "ASR error: \(error.localizedDescription)" }
             }
-            group.addTask { @MainActor in
-                do {
-                    try await self.ttsService.loadModel()
-                    print("[Pipeline] Kokoro TTS loaded")
-                } catch {
-                    print("[Pipeline] TTS load failed: \(error.localizedDescription)")
-                    self.loadingStatus = "TTS error: \(error.localizedDescription)"
-                }
+        }()
+        async let ttsLoad: Void = {
+            do {
+                try await self.ttsService.loadModel()
+                print("[Pipeline] Kokoro TTS loaded")
+            } catch {
+                print("[Pipeline] TTS load failed: \(error.localizedDescription)")
+                await MainActor.run { self.loadingStatus = "TTS error: \(error.localizedDescription)" }
             }
-        }
+        }()
+        _ = await (asrLoad, ttsLoad)
 
         translationService.checkAvailability()
         print("[Pipeline] FoundationModels available: \(translationService.isAvailable)")
