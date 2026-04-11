@@ -86,9 +86,9 @@ final class TranslationService {
     ) async throws -> TranslationServiceResult {
         print("[Translation] \(source.displayName) → \(target.displayName): '\(text)'")
 
-        // IMPORTANT: Do NOT set maximumResponseTokens here. With @Generable, constrained
-        // sampling terminates naturally when the JSON schema is complete. Setting a token
-        // limit risks truncating the JSON mid-generation → decodingFailure.
+        // Do NOT set maximumResponseTokens with @Generable. Per Apple's docs, enforcing a
+        // token limit "can lead to the model producing malformed results." Constrained sampling
+        // terminates naturally when the JSON schema is complete.
         let options = GenerationOptions(
             sampling: .greedy,
             temperature: 0.0

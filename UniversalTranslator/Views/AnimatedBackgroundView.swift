@@ -5,13 +5,15 @@ import SwiftUI
 struct AnimatedBackgroundView: View {
     var body: some View {
         ZStack {
-            // Charcoal base
+            // Charcoal base (RGB: 28, 28, 33)
             Color(red: 0.11, green: 0.11, blue: 0.13)
 
             // Soft radial accent from top
             RadialGradient(
                 colors: [
+                    // Accent color (RGB: 46, 41, 56)
                     Color(red: 0.18, green: 0.16, blue: 0.22),
+                    // Charcoal base (RGB: 28, 28, 33)
                     Color(red: 0.11, green: 0.11, blue: 0.13),
                 ],
                 center: .top,

@@ -2,6 +2,7 @@ import Foundation
 import MLXAudioTTS
 import MLXAudioCore
 import MLX
+import NaturalLanguage
 
 /// Text-to-speech service backed by Kokoro TTS running on Metal via MLX.
 ///
@@ -89,41 +90,73 @@ final class TextToSpeechService {
         print("[TTS] Kokoro TTS fully ready")
     }
 
+    /// Kokoro's hard limit is 510 phoneme tokens (KokoroModel.maxTokenCount).
+    /// We target slightly below to leave room for start/end tokens the model prepends.
+    private static let maxPhonemeTokens = 500
+
     /// Stream-synthesize `text` in `language` and play it through the speaker.
-    /// Cancellable via `stop()`.
+    /// For long text, phonemizes first, then chunks at sentence boundaries to stay
+    /// within Kokoro's 510 phoneme-token limit. Cancellable via `stop()`.
     func speak(text: String, language: Language) async throws {
         guard let model = ttsModel, let player = audioPlayer else {
             print("[TTS] ERROR: model or player not loaded")
             return
         }
 
-        print("[TTS] Speaking: '\(text)' | Language: \(language.displayName) | Voice: \(language.kokoroVoice)")
+        // Phonemize the full text so we can measure actual token counts for chunking.
+        // Kokoro's tokenizer maps each IPA character to one token, so
+        // phoneme string length == token count.
+        let lang = KokoroMultilingualProcessor.languageForVoice(language.kokoroVoice)
+        let chunks: [String]
+        if let processor = kokoroModel?.textProcessor {
+            do {
+                let phonemized = try processor.process(text: text, language: lang)
+                if phonemized.count <= Self.maxPhonemeTokens {
+                    // Fits in one shot — pass original text (model will re-phonemize internally)
+                    chunks = [text]
+                } else {
+                    // Too long — split original text at sentence boundaries and
+                    // verify each chunk's phoneme count fits
+                    chunks = try chunkBySentence(text: text, language: lang, processor: processor)
+                }
+            } catch {
+                print("[TTS] Phonemization failed, falling back to character chunking: \(error)")
+                chunks = chunkByCharCount(text)
+            }
+        } else {
+            chunks = chunkByCharCount(text)
+        }
+
+        print("[TTS] Speaking \(chunks.count) chunk(s) in \(language.displayName) voice=\(language.kokoroVoice)")
 
         isSpeaking = true
         stopRequested = false
 
         player.startStreaming(sampleRate: Double(model.sampleRate))
 
-        let stream = model.generateStream(
-            text: text,
-            voice: language.kokoroVoice,
-            refAudio: nil,
-            refText: nil,
-            language: nil, // Kokoro auto-detects from voice prefix
-            generationParameters: model.defaultGenerationParameters
-        )
-
         var totalSamples = 0
         do {
-            for try await event in stream {
-                if stopRequested {
-                    print("[TTS] Stop requested mid-generation")
-                    break
-                }
-                if case .audio(let samples) = event {
-                    let floatSamples = samples.asArray(Float.self)
-                    player.scheduleAudioChunk(floatSamples, withCrossfade: true)
-                    totalSamples += floatSamples.count
+            for (i, chunk) in chunks.enumerated() {
+                if stopRequested { break }
+
+                print("[TTS] Chunk \(i + 1)/\(chunks.count): '\(chunk.prefix(60))...' (\(chunk.count) chars)")
+
+                let stream = model.generateStream(
+                    text: chunk,
+                    voice: language.kokoroVoice,
+                    refAudio: nil,
+                    refText: nil,
+                    language: nil,
+                    generationParameters: model.defaultGenerationParameters
+                )
+
+                for try await event in stream {
+                    if stopRequested { break }
+                    if case .audio(let samples) = event {
+                        let floatSamples = samples.asArray(Float.self)
+                        player.scheduleAudioChunk(floatSamples, withCrossfade: true)
+                        totalSamples += floatSamples.count
+                    }
                 }
             }
 
@@ -134,7 +167,6 @@ final class TextToSpeechService {
                 let durationSec = Double(totalSamples) / Double(model.sampleRate)
                 print("[TTS] Done: \(totalSamples) samples, \(String(format: "%.2f", durationSec))s audio")
 
-                // Wait for the queued buffers to drain, but bail out if stop is requested.
                 while player.isSpeaking {
                     if stopRequested {
                         print("[TTS] Stop requested during playback")
@@ -161,6 +193,68 @@ final class TextToSpeechService {
         MLX.Memory.clearCache()
         let snap = MLX.Memory.snapshot()
         print("[TTS] Memory after clear: active=\(snap.activeMemory / 1024 / 1024)MB cache=\(snap.cacheMemory / 1024 / 1024)MB")
+    }
+
+    /// Split text at sentence boundaries, greedily merging sentences until
+    /// the phonemized token count would exceed `maxPhonemeTokens`.
+    private func chunkBySentence(text: String, language: String?, processor: TextProcessor) throws -> [String] {
+        let sentences = splitSentences(text)
+        var chunks: [String] = []
+        var currentChunk = ""
+
+        for sentence in sentences {
+            let candidate = currentChunk.isEmpty ? sentence : currentChunk + " " + sentence
+            let phonemeCount = (try? processor.process(text: candidate, language: language))?.count ?? candidate.count
+
+            if phonemeCount > Self.maxPhonemeTokens && !currentChunk.isEmpty {
+                // Adding this sentence exceeds the limit — flush the current chunk
+                chunks.append(currentChunk)
+                currentChunk = sentence
+            } else {
+                currentChunk = candidate
+            }
+        }
+        if !currentChunk.isEmpty { chunks.append(currentChunk) }
+
+        print("[TTS] Chunked \(sentences.count) sentences into \(chunks.count) chunk(s)")
+        return chunks
+    }
+
+    /// Fallback chunker when phonemization isn't available.
+    /// Uses a conservative character estimate (1 token ~ 2 chars for IPA).
+    private func chunkByCharCount(_ text: String) -> [String] {
+        let maxChars = Self.maxPhonemeTokens * 2
+        if text.count <= maxChars { return [text] }
+
+        let sentences = splitSentences(text)
+        var chunks: [String] = []
+        var chunk = ""
+        for sentence in sentences {
+            if chunk.count + sentence.count + 1 > maxChars && !chunk.isEmpty {
+                chunks.append(chunk)
+                chunk = sentence
+            } else {
+                chunk += (chunk.isEmpty ? "" : " ") + sentence
+            }
+        }
+        if !chunk.isEmpty { chunks.append(chunk) }
+        return chunks
+    }
+
+    /// Split text into sentences using Apple's NLTokenizer, which handles
+    /// sentence boundaries correctly across all supported languages (including
+    /// Japanese, Chinese, etc. where punctuation rules differ from English).
+    private func splitSentences(_ text: String) -> [String] {
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = text
+        var sentences: [String] = []
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+            let sentence = String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !sentence.isEmpty { sentences.append(sentence) }
+            return true
+        }
+        // If the tokenizer returned nothing (shouldn't happen), treat the whole text as one sentence
+        return sentences.isEmpty ? [text] : sentences
     }
 
     /// Interrupt any in-progress generation or playback.

@@ -12,10 +12,13 @@ struct ModelLoadingView: View {
             Spacer()
 
             VStack(spacing: 16) {
-                Image(systemName: "globe")
-                    .font(.system(size: 48, weight: .thin))
-                    .foregroundStyle(.white)
-                    .symbolEffect(.pulse)
+                // Matches the app icon composition: globe + two colored mic dots
+                ZStack {
+                    Image(systemName: "globe")
+                        .font(.system(size: 52, weight: .thin))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .symbolEffect(.pulse)
+                }
 
                 Text("Universal Translator")
                     .font(.title2)

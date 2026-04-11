@@ -3,15 +3,10 @@ import Foundation
 
 /// Speech-to-text service backed by WhisperKit running on the Apple Neural Engine.
 ///
-/// This service is the first stage of the translation pipeline. It:
-///   1. Downloads a Whisper CoreML model on first launch (or loads from cache).
-///   2. Pre-warms the AVAudioEngine so the first mic press is instant.
-///   3. Streams transcription as the user speaks via `AudioStreamTranscriber`.
-///   4. Filters out known Whisper hallucinations (e.g. "Thanks for watching") that
-///      appear when the model is fed silence or low-energy audio.
-///
-/// We use the quantized "small" variant (`openai_whisper-small_216MB`) for a good
-/// balance of quality and on-device speed.
+/// The transcription pipeline runs continuously after model loading with input
+/// suppressed (silence injected). When the user presses a mic button, input is
+/// unsuppressed and live transcription begins immediately with zero cold-start.
+/// On release, input is suppressed again and the accumulated text is returned.
 @Observable
 @MainActor
 final class SpeechRecognitionService {
@@ -23,35 +18,14 @@ final class SpeechRecognitionService {
 
     private var whisperKit: WhisperKit?
     private var streamTranscriber: AudioStreamTranscriber?
-    private var audioEngineWarmed = false
+    /// The language currently configured for the running transcriber.
+    private var activeLanguage: Language?
 
-    /// WhisperKit's placeholder text emitted before any speech is detected.
-    /// We strip this so it doesn't accidentally get sent through the translation pipeline.
-    private static let whisperKitPlaceholder = "Waiting for speech..."
-
-    /// Common Whisper hallucinations on silence or noise. The training data
-    /// included a lot of YouTube transcripts, so it loves to insert these on quiet input.
-    private static let hallucinationPatterns: [String] = [
-        "thank you",
-        "thanks for watching",
-        "subscribe",
-        "like and subscribe",
-        "please subscribe",
-        "the end",
-        "you",
-        "bye",
-        "...",
-        "♪",
-        "music",
-    ]
-
-    /// WhisperKit model variant. The `_216MB` suffix is a quantized small model
-    /// that runs in ~150ms per chunk on iPhone 15 Pro / Apple Silicon Macs.
     private static let modelVariant = "openai_whisper-small_216MB"
     private static let modelRepo = "argmaxinc/whisperkit-coreml"
 
-    /// Loads the Whisper CoreML model, preferring an on-disk cache if available.
-    /// Also pre-warms the audio engine so the first recording press has zero startup latency.
+    /// Loads the Whisper CoreML model, requests mic permission, and starts the
+    /// transcription pipeline in suppressed mode so it's ready for instant use.
     func loadModel() async throws {
         let config = WhisperKitConfig(
             verbose: true,
@@ -62,8 +36,6 @@ final class SpeechRecognitionService {
         whisperKit = try await WhisperKit(config)
         guard let whisperKit else { return }
 
-        // Skip the network round-trip if the model is already on disk.
-        // WhisperKit's HubApi caches under Documents/huggingface/models/<repo>/<variant>.
         let documentsURL = try FileManager.default.url(
             for: .documentDirectory,
             in: .userDomainMask,
@@ -95,38 +67,67 @@ final class SpeechRecognitionService {
         try await whisperKit.prewarmModels()
         try await whisperKit.loadModels()
 
-        await warmAudioEngine()
+        let granted = await AudioProcessor.requestRecordPermission()
+        print("[ASR] Microphone permission: \(granted ? "granted" : "denied")")
+
+        // Start the pipeline immediately in suppressed mode. The audio engine
+        // stays warm and the first mic press unsuppresses with zero latency.
+        await startPipeline(language: .english)
+        (whisperKit.audioProcessor as? AudioProcessor)?.setInputSuppressed(true)
 
         isLoaded = true
         loadingProgress = 1.0
-        print("[ASR] WhisperKit model loaded and audio engine pre-warmed")
+        print("[ASR] WhisperKit model loaded, pipeline running (suppressed)")
     }
 
-    /// Briefly start and stop the audio engine after model load.
-    /// Without this the first user-initiated recording incurs a multi-hundred-ms cold start.
-    private func warmAudioEngine() async {
-        guard let whisperKit, !audioEngineWarmed else { return }
-        print("[ASR] Pre-warming audio engine...")
-        do {
-            try whisperKit.audioProcessor.startRecordingLive { _ in }
-            try? await Task.sleep(for: .milliseconds(500))
-            whisperKit.audioProcessor.stopRecording()
-            audioEngineWarmed = true
-            print("[ASR] Audio engine pre-warmed")
-        } catch {
-            print("[ASR] Audio engine pre-warm failed: \(error.localizedDescription)")
-        }
-    }
-
-    /// Begin streaming microphone audio and transcribing it in real time.
-    ///
-    /// Pass the source language explicitly so Whisper doesn't have to detect it
-    /// (forcing the language is faster and more accurate when we already know it).
+    /// Start a fresh recording session. Recreates the AudioStreamTranscriber
+    /// so accumulated segments from previous recordings don't carry over.
+    /// The audioProcessor (and its AVAudioEngine) stays alive — only the
+    /// transcriber is recreated, which is cheap.
     func startRecording(language: Language) async throws {
-        guard let whisperKit, !isRecording else { return }
+        guard let whisperKit else { return }
+
+        // Tear down old transcriber to clear accumulated segments
+        await stopPipeline()
 
         currentTranscription = ""
         confirmedText = ""
+
+        // Create fresh transcriber with clean state
+        await startPipeline(language: language)
+
+        // Unsuppress — real audio starts flowing
+        (whisperKit.audioProcessor as? AudioProcessor)?.setInputSuppressed(false)
+        isRecording = true
+        print("[ASR] Recording started in \(language.displayName)")
+    }
+
+    /// Suppress audio input and return the final transcription.
+    func stopRecording() async -> String {
+        guard let whisperKit else { return "" }
+
+        // Suppress — silence injected, pipeline keeps running
+        (whisperKit.audioProcessor as? AudioProcessor)?.setInputSuppressed(true)
+        isRecording = false
+
+        let finalText = currentTranscription.trimmingCharacters(in: .whitespacesAndNewlines)
+        print("[ASR] Recording stopped. Final text: '\(finalText)'")
+
+        currentTranscription = ""
+        confirmedText = ""
+
+        return finalText
+    }
+
+    // MARK: - Pipeline lifecycle
+
+    /// Start the AudioStreamTranscriber for the given language.
+    private func startPipeline(language: Language) async {
+        guard let whisperKit, streamTranscriber == nil else { return }
+        guard let tokenizer = whisperKit.tokenizer else {
+            print("[ASR] ERROR: tokenizer not loaded")
+            return
+        }
 
         let options = DecodingOptions(
             verbose: false,
@@ -141,12 +142,6 @@ final class SpeechRecognitionService {
             noSpeechThreshold: 0.5
         )
 
-        guard let tokenizer = whisperKit.tokenizer else {
-            throw SpeechRecognitionError.tokenizerNotLoaded
-        }
-
-        print("[ASR] Starting recording in \(language.displayName)")
-
         streamTranscriber = AudioStreamTranscriber(
             audioEncoder: whisperKit.audioEncoder,
             featureExtractor: whisperKit.featureExtractor,
@@ -158,22 +153,22 @@ final class SpeechRecognitionService {
             silenceThreshold: 0.3,
             stateChangeCallback: { @Sendable [weak self] _, newState in
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    let confirmed = newState.confirmedSegments.map(\.text).joined(separator: " ")
-                    let current = newState.currentText
-                    let combined = (confirmed + " " + current).trimmingCharacters(in: .whitespaces)
+                    guard let self, self.isRecording else { return }
 
-                    // Don't surface the placeholder or known hallucinations to the UI.
-                    if combined == Self.whisperKitPlaceholder { return }
-                    if !self.isHallucination(combined) {
-                        self.confirmedText = confirmed
-                        self.currentTranscription = combined
-                    }
+                    let confirmed = newState.confirmedSegments.map(\.text).joined()
+                    let unconfirmed = newState.unconfirmedSegments.map(\.text).joined()
+                    let fullText = (confirmed + unconfirmed).trimmingCharacters(in: .whitespaces)
+
+                    self.confirmedText = confirmed.trimmingCharacters(in: .whitespaces)
+                    self.currentTranscription = fullText
+
+                    print("[ASR] confirmed(\(newState.confirmedSegments.count)): '\(self.confirmedText)'")
+                    print("[ASR] unconfirmed(\(newState.unconfirmedSegments.count)): '\(unconfirmed.trimmingCharacters(in: .whitespaces))'")
                 }
             }
         )
 
-        isRecording = true
+        activeLanguage = language
 
         Task {
             do {
@@ -182,37 +177,16 @@ final class SpeechRecognitionService {
                 print("[ASR] Stream transcription error: \(error.localizedDescription)")
             }
         }
+
+        print("[ASR] Pipeline started for \(language.displayName)")
     }
 
-    /// Stops recording and returns the cleaned final transcription.
-    /// Returns an empty string if the result was filtered as a hallucination or placeholder.
-    func stopRecording() async -> String {
+    /// Stop and tear down the current AudioStreamTranscriber.
+    private func stopPipeline() async {
         await streamTranscriber?.stopStreamTranscription()
-        isRecording = false
-
-        let finalText = currentTranscription.trimmingCharacters(in: .whitespacesAndNewlines)
-        print("[ASR] Recording stopped. Final text: '\(finalText)'")
-
-        currentTranscription = ""
-        confirmedText = ""
         streamTranscriber = nil
-
-        if finalText == Self.whisperKitPlaceholder || isHallucination(finalText) || finalText.count < 2 {
-            print("[ASR] Filtered: '\(finalText)'")
-            return ""
-        }
-        return finalText
-    }
-
-    private func isHallucination(_ text: String) -> Bool {
-        let lower = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
-        if lower.isEmpty { return true }
-        for pattern in Self.hallucinationPatterns {
-            if lower == pattern || lower.hasPrefix(pattern) {
-                return true
-            }
-        }
-        return false
+        activeLanguage = nil
+        print("[ASR] Pipeline stopped")
     }
 }
 

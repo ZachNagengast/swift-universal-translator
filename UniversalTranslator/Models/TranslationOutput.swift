@@ -6,7 +6,7 @@ import FoundationModels
 /// first (giving it a place to reason about ASR errors), then `translatedText`.
 @Generable(description: "A translation of spoken text between two languages")
 struct TranslationOutput {
-    @Guide(description: "If a word was misheard, write 'X → Y'. Otherwise leave empty.")
+    @Guide(description: "Empty string unless the ASR misheard an English word, e.g. 'rain man → ramen'. Do NOT put translations here.")
     var corrections: String
 
     @Guide(description: "The translated text in the target language")

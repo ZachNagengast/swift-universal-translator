@@ -36,11 +36,19 @@ struct ConversationView: View {
                             .id(message.id)
                         }
 
-                        // Live transcription bubble (visible while the user is speaking).
-                        if !liveTranscription.isEmpty {
+                        // Live transcription bubble — appears on mic press and stays visible
+                        // through translating/speaking until the final bubble replaces it.
+                        if case .listening = pipelineState {
+                            liveTextBubble(
+                                text: liveTranscription.isEmpty ? "..." : liveTranscription,
+                                label: "Listening...",
+                                side: activeSide ?? .left
+                            )
+                            .id("live-transcription")
+                        } else if !liveTranscription.isEmpty {
                             liveTextBubble(
                                 text: liveTranscription,
-                                label: "Listening...",
+                                label: "Transcribed",
                                 side: activeSide ?? .left
                             )
                             .id("live-transcription")
